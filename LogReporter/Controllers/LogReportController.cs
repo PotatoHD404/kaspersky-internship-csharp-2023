@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -11,27 +12,33 @@ using Microsoft.AspNetCore.Mvc;
 namespace kaspersky_internship_csharp_2023.Controllers;
 
 [ApiController]
-[Route("[controller]")]
+[Route("LogReports")]
 public partial class LogReportController : ControllerBase
 {
-    private Dictionary<String, Task<List<LogReport>>> tasks = new Dictionary<string, Task<List<LogReport>>>();
+    private static ConcurrentDictionary<String, Task<List<LogReport>>> tasks = new ConcurrentDictionary<string, Task<List<LogReport>>>();
     
     
-    [HttpGet]
-    [Route("AddTask")]
-    public ActionResult<LogInfo> SetupTak(string logDirectory, string serviceNameRegex)
+    [HttpPost]
+    public ActionResult<CreateTaskResult> Post([FromBody] CreateTaskRequest request)
     {
+        var logDirectory = request.LogDirectory;
+        var serviceNameRegex = request.ServiceNameRegex;
+
+
+        if (!Directory.Exists(logDirectory))
+        {
+            return BadRequest();
+        }
         var guid = Guid.NewGuid().ToString();
         var task = GenerateReportsAsync(logDirectory, serviceNameRegex);
-        tasks[guid] = task;
-        task.Start();
-        
-        return new LogInfo {Id = guid};
+        tasks.TryAdd(guid, task);
+
+        return new CreateTaskResult {Id = guid};
     }
     
     [HttpGet]
-    [Route("GetTask")]
-    public ActionResult<TaskInfo> GetTask(string id)
+    [Route("{id}")]
+    public ActionResult<TaskInfo> GetOne(string id)
     {
         if (!tasks.ContainsKey(id))
         {
@@ -51,33 +58,123 @@ public partial class LogReportController : ControllerBase
 
         return new TaskInfo {Id = id, Status = "In progress"};
     }
+    
+    [HttpGet]
+    public ActionResult<TasksInfo> GetAll()
+    {
+        var tasksInfo = new TasksInfo();
+        tasksInfo.Tasks = new List<TaskInfo>();
+        
+        foreach (var (id, task) in tasks.ToArray())
+        {
+
+            if (task.IsCompleted)
+            {
+                tasksInfo.Tasks.Add(new TaskInfo {Id = id, Status = "Completed"});
+                tasksInfo.NumberOfCompletedTasks++;
+            }
+            else if (task.IsFaulted)
+            {
+                tasksInfo.Tasks.Add(new TaskInfo {Id = id, Status = "Faulted"});
+                tasksInfo.NumberOfFaultedTasks++;
+            }
+            else
+            {
+                tasksInfo.Tasks.Add(new TaskInfo {Id = id, Status = "In progress"});
+                tasksInfo.NumberOfInProgressTasks++;
+            }
+            tasksInfo.NumberOfTasks++;
+        }
+
+        return tasksInfo;
+    }
+    
+    [HttpDelete]
+    [Route("{id}")]
+    public ActionResult Delete(string id)
+    {
+        if (!tasks.ContainsKey(id))
+        {
+            return NotFound();
+        }
+
+        tasks.Remove(id, out _);
+        return Ok();
+    }
 
 
     private async Task<List<LogReport>> GenerateReportsAsync(string logDirectory, string serviceNameRegex)
     {
-        var reports = new List<LogReport>();
+        var reports = new Dictionary<string, LogReport>();
 
         var regex = new Regex(serviceNameRegex);
-        var serviceLogFiles = Directory.GetFiles(logDirectory)
-            .Where(file => regex.IsMatch(Path.GetFileNameWithoutExtension(file).Split('.')[0]));
 
+        var serviceLogFiles = Directory.GetFiles(logDirectory)
+            .Where(file => regex.IsMatch(Path.GetFileNameWithoutExtension(file).Split('.')[0])).ToList();
         foreach (var serviceLogFile in serviceLogFiles)
         {
             var report = await ProcessLogFileAsync(serviceLogFile);
-            if (report != null)
+            if (reports.ContainsKey(report.ServiceName))
             {
-                reports.Add(report);
+                var existingReport = reports[report.ServiceName];
+                existingReport.CategoryCounts = existingReport.CategoryCounts
+                    .Concat(report.CategoryCounts)
+                    .GroupBy(pair => pair.Key)
+                    .ToDictionary(group => group.Key, group => group.Sum(pair => pair.Value));
+                existingReport.NumberOfRotations += report.NumberOfRotations;
+                if (existingReport.EarliestEntry == null)
+                {
+                    existingReport.EarliestEntry = report.EarliestEntry;
+                }
+                else if (report.EarliestEntry != null)
+                {
+                    existingReport.EarliestEntry = existingReport.EarliestEntry < report.EarliestEntry
+                        ? existingReport.EarliestEntry
+                        : report.EarliestEntry;
+                }
+                if (existingReport.LatestEntry == null)
+                {
+                    existingReport.LatestEntry = report.LatestEntry;
+                }
+                else if (report.LatestEntry != null)
+                {
+                    existingReport.LatestEntry = existingReport.LatestEntry > report.LatestEntry
+                        ? existingReport.LatestEntry
+                        : report.LatestEntry;
+                }
+            }
+            else
+            {
+                reports[report.ServiceName] = report;
             }
         }
 
-        return reports;
+        return reports.Values.ToList();
+    }
+    
+    static string MaskEverySecondCharacter(string input)
+    {
+        char[] maskedArray = new char[input.Length];
+        for (int i = 0; i < input.Length; i++)
+        {
+            maskedArray[i] = i % 2 == 0 ? input[i] : '*';
+        }
+        return new string(maskedArray);
     }
 
-    private async Task<LogReport?> ProcessLogFileAsync(string logFile)
+    private async Task<LogReport> ProcessLogFileAsync(string logFile)
     {
         var logReport = new LogReport();
 
         var fileName = Path.GetFileName(logFile);
+        if (fileName == null)
+        {
+            throw new Exception("File name is null");
+        }
+        if (fileName.Split('.').Length < 2)
+        {
+            throw new Exception("File name is invalid");
+        }
         var serviceName = fileName.Split('.')[0];
         logReport.ServiceName = serviceName;
 
@@ -86,11 +183,23 @@ public partial class LogReportController : ControllerBase
         DateTime minDate = DateTime.MaxValue;
         DateTime maxDate = DateTime.MinValue;
         var categoryCounts = new Dictionary<string, int>();
-        var rotationRegex = MyRegex();
-
+        var rotationRegex = FileRegex();
+        var emailRegex = EmailRegex();
         foreach (var logLine in logLines)
         {
-            if (!DateTime.TryParse(logLine.Substring(1, 19), out DateTime logDate))
+            var line = logLine.Trim();
+            // replace every second symbol in emails with *
+            var emails = emailRegex.Matches(line);
+            foreach (Match email in emails)
+            {
+                string originalEmail = email.Value;
+                string maskedName = MaskEverySecondCharacter(email.Groups["name"].Value);
+                string domain = email.Groups["domain"].Value;
+                string maskedEmail = maskedName + "@" + domain;
+
+                line = line.Replace(originalEmail, maskedEmail);
+            }
+            if (!DateTime.TryParse(line.Substring(1, 19), out DateTime logDate))
             {
                 continue;
             }
@@ -105,7 +214,7 @@ public partial class LogReportController : ControllerBase
                 maxDate = logDate;
             }
 
-            var category = logLine.Split(']')[1].Trim();
+            var category = line.Split(']')[1].Trim().Substring(1);
             if (!categoryCounts.ContainsKey(category))
             {
                 categoryCounts[category] = 0;
@@ -114,50 +223,27 @@ public partial class LogReportController : ControllerBase
             categoryCounts[category]++;
         }
 
-        logReport.EarliestEntry = minDate;
-        logReport.LatestEntry = maxDate;
+        logReport.EarliestEntry = minDate == DateTime.MaxValue ? null : minDate;
+        logReport.LatestEntry = maxDate == DateTime.MinValue ? null : maxDate;
         logReport.CategoryCounts = categoryCounts;
         var directoryName = Path.GetDirectoryName(logFile);
         if (directoryName == null)
         {
-            return null;
+            return logReport;
         }
         var rotationFiles = Directory.GetFiles(directoryName, $"{serviceName}.*.log");
         logReport.NumberOfRotations = rotationFiles.Count(file => rotationRegex.IsMatch(file));
 
         return logReport;
     }
+    
+    
 
     [GeneratedRegex("\\d+\\.log$")]
-    private static partial Regex MyRegex();
+    private static partial Regex FileRegex();
+    // email regex named group
+    [GeneratedRegex("(?<name>\\w+)@(?<domain>\\w+\\.\\w{2,})")]
+    private static partial Regex EmailRegex();
+    
+    
 }
-
-
-/*[ApiController]
-[Route("[controller]")]
-public class WeatherForecastController : ControllerBase
-{
-    private static readonly string[] Summaries = new[]
-    {
-        "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-    };
-
-    private readonly ILogger<WeatherForecastController> _logger;
-
-    public WeatherForecastController(ILogger<WeatherForecastController> logger)
-    {
-        _logger = logger;
-    }
-
-    [HttpGet(Name = "GetWeatherForecast")]
-    public IEnumerable<WeatherForecast> Get()
-    {
-        return Enumerable.Range(1, 5).Select(index => new WeatherForecast
-            {
-                Date = DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-                TemperatureC = Random.Shared.Next(-20, 55),
-                Summary = Summaries[Random.Shared.Next(Summaries.Length)]
-            })
-            .ToArray();
-    }
-}*/
