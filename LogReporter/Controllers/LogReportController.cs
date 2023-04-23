@@ -6,8 +6,12 @@ using System.Linq;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using kaspersky_internship_csharp_2023.data;
 using kaspersky_internship_csharp_2023.dto;
+using kaspersky_internship_csharp_2023.models;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using LogReport = kaspersky_internship_csharp_2023.dto.LogReport;
 
 namespace kaspersky_internship_csharp_2023.Controllers;
 
@@ -15,8 +19,16 @@ namespace kaspersky_internship_csharp_2023.Controllers;
 [Route("LogReports")]
 public partial class LogReportController : ControllerBase
 {
-    private static ConcurrentDictionary<String, Task<List<LogReport>>> tasks = new ConcurrentDictionary<string, Task<List<LogReport>>>();
+    private static ConcurrentDictionary<String, Task<Task<List<LogReport>?>>> tasks = new ();
+    private readonly LogReportContext _context;
+    private readonly IServiceScopeFactory _serviceScopeFactory;
     
+    public LogReportController(LogReportContext context, IServiceScopeFactory serviceScopeFactory)
+    {
+        _context = context;
+        _serviceScopeFactory = serviceScopeFactory;
+        _context.Database.EnsureCreated();
+    }
     
     [HttpPost]
     public ActionResult<CreateTaskResult> Post([FromBody] CreateTaskRequest request)
@@ -30,7 +42,67 @@ public partial class LogReportController : ControllerBase
             return BadRequest();
         }
         var guid = Guid.NewGuid().ToString();
-        var task = GenerateReportsAsync(logDirectory, serviceNameRegex);
+        _context.ReportTasks.Add(new ReportTask
+        {
+            Id = guid,
+            IsCompleted = false,
+            IsFaulted = false,
+            LogDirectory = logDirectory,
+            ServiceNameRegex = serviceNameRegex
+        });
+        _context.SaveChangesAsync();
+        var task = GenerateReportsAsync(logDirectory, serviceNameRegex).ContinueWith(async (t) =>
+        {
+            using (var scope = _serviceScopeFactory.CreateScope())
+            {
+                var _context = scope.ServiceProvider.GetRequiredService<LogReportContext>();
+
+                
+
+                var reportTask = await _context.ReportTasks.FindAsync(guid);
+
+                if (reportTask == null)
+                {
+                    Console.WriteLine("ReportTask not found");
+                    return null;
+                }
+                reportTask.IsCompleted = t.IsCompleted;
+                reportTask.IsFaulted = t.IsFaulted;
+                if (t.IsFaulted)
+                {
+                    Console.WriteLine("Task is faulted");
+                    return null;
+                }
+
+                reportTask.LogReports = t.Result.Select(logReport => new models.LogReport
+                {
+                    ServiceName = logReport.ServiceName,
+                    EarliestEntry = logReport.EarliestEntry,
+                    LatestEntry = logReport.LatestEntry,
+                    NumberOfRotations = logReport.NumberOfRotations,
+                    CategoryCounts = logReport.CategoryCounts.Select(categoryCount => new CategoryCount
+                    {
+                        Category = categoryCount.Key,
+                        Count = categoryCount.Value
+                    }).ToList()
+                }).ToList();
+
+                try
+                {
+                   await _context.SaveChangesAsync();
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                    throw;
+                }
+                tasks.TryRemove(guid, out _);
+
+            }
+            return t.Result;
+        });
+
+
         tasks.TryAdd(guid, task);
 
         return new CreateTaskResult {Id = guid};
@@ -40,22 +112,31 @@ public partial class LogReportController : ControllerBase
     [Route("{id}")]
     public ActionResult<TaskInfo> GetOne(string id)
     {
-        if (!tasks.ContainsKey(id))
+        var reportTask = _context.ReportTasks.Include(rt => rt.LogReports)
+            .ThenInclude(lr => lr.CategoryCounts)
+            .SingleOrDefault(rt => rt.Id == id);
+        if (reportTask == null)
         {
             return NotFound();
         }
-
-        var task = tasks[id];
-        if (task.IsCompleted)
+        
+        if (reportTask.IsCompleted)
         {
-            return new TaskInfo {Id = id, Status = "Completed", Result = task.Result};
+            return new TaskInfo {Id = id, Status = "Completed", Result = reportTask.LogReports.Select(logReport => new LogReport
+            {
+                ServiceName = logReport.ServiceName,
+                EarliestEntry = logReport.EarliestEntry,
+                LatestEntry = logReport.LatestEntry,
+                NumberOfRotations = logReport.NumberOfRotations,
+                CategoryCounts = logReport.CategoryCounts.ToDictionary(categoryCount => categoryCount.Category, categoryCount => categoryCount.Count)
+            }).ToList()};
         }
-
-        if (task.IsFaulted)
+        
+        if (reportTask.IsFaulted)
         {
             return new TaskInfo {Id = id, Status = "Faulted"};
         }
-
+        
         return new TaskInfo {Id = id, Status = "In progress"};
     }
     
@@ -63,45 +144,17 @@ public partial class LogReportController : ControllerBase
     public ActionResult<TasksInfo> GetAll()
     {
         var tasksInfo = new TasksInfo();
-        tasksInfo.Tasks = new List<TaskInfo>();
-        
-        foreach (var (id, task) in tasks.ToArray())
+        tasksInfo.Tasks = _context.ReportTasks.Select(reportTask => new TaskInfo
         {
-
-            if (task.IsCompleted)
-            {
-                tasksInfo.Tasks.Add(new TaskInfo {Id = id, Status = "Completed"});
-                tasksInfo.NumberOfCompletedTasks++;
-            }
-            else if (task.IsFaulted)
-            {
-                tasksInfo.Tasks.Add(new TaskInfo {Id = id, Status = "Faulted"});
-                tasksInfo.NumberOfFaultedTasks++;
-            }
-            else
-            {
-                tasksInfo.Tasks.Add(new TaskInfo {Id = id, Status = "In progress"});
-                tasksInfo.NumberOfInProgressTasks++;
-            }
-            tasksInfo.NumberOfTasks++;
-        }
-
+            Id = reportTask.Id,
+            Status = reportTask.IsCompleted ? "Completed" : reportTask.IsFaulted ? "Faulted" : "In progress"
+        }).ToList();
+        tasksInfo.NumberOfTasks = tasksInfo.Tasks.Count;
+        tasksInfo.NumberOfCompletedTasks = tasksInfo.Tasks.Count(task => task.Status == "Completed");
+        tasksInfo.NumberOfFaultedTasks = tasksInfo.Tasks.Count(task => task.Status == "Faulted");
+        tasksInfo.NumberOfInProgressTasks = tasksInfo.Tasks.Count(task => task.Status == "In progress");
         return tasksInfo;
     }
-    
-    [HttpDelete]
-    [Route("{id}")]
-    public ActionResult Delete(string id)
-    {
-        if (!tasks.ContainsKey(id))
-        {
-            return NotFound();
-        }
-
-        tasks.Remove(id, out _);
-        return Ok();
-    }
-
 
     private async Task<List<LogReport>> GenerateReportsAsync(string logDirectory, string serviceNameRegex)
     {
@@ -112,7 +165,7 @@ public partial class LogReportController : ControllerBase
         var curTasks = serviceLogFiles.Select(async serviceLogFile => await ProcessLogFileAsync(serviceLogFile)).ToArray();
         await Task.WhenAll(curTasks);
         var keyValuePairs = curTasks.Select(task => new KeyValuePair<string,  LogReport>(task.Result.ServiceName, task.Result));
-        Dictionary<string, LogReport> reports = keyValuePairs.GroupBy(pair => pair.Key)
+        var reports = keyValuePairs.GroupBy(pair => pair.Key)
             .ToDictionary(group => group.Key, group => new LogReport
             {
                 ServiceName = group.Key,
@@ -123,10 +176,9 @@ public partial class LogReportController : ControllerBase
                 NumberOfRotations = group.Sum(pair => pair.Value.NumberOfRotations),
                 EarliestEntry = group.Select(pair => pair.Value.EarliestEntry).Min(),
                 LatestEntry = group.Select(pair => pair.Value.LatestEntry).Max()
-            });
+            }).Values.ToList();
 
-
-        return reports.Values.ToList();
+        return reports;
     }
     
     static string MaskEverySecondCharacter(string input)
