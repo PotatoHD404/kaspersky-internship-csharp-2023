@@ -1,7 +1,4 @@
-﻿using System.Text.Json.Serialization;
-using kaspersky_internship_csharp_2023.dto;
-
-namespace kaspersky_internship_csharp_2023.models;
+﻿namespace kaspersky_internship_csharp_2023.models;
 
 public class ReportTask
 {
