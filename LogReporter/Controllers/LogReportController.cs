@@ -105,49 +105,26 @@ public partial class LogReportController : ControllerBase
 
     private async Task<List<LogReport>> GenerateReportsAsync(string logDirectory, string serviceNameRegex)
     {
-        var reports = new Dictionary<string, LogReport>();
-
         var regex = new Regex(serviceNameRegex);
 
         var serviceLogFiles = Directory.GetFiles(logDirectory)
             .Where(file => regex.IsMatch(Path.GetFileNameWithoutExtension(file).Split('.')[0])).ToList();
-        foreach (var serviceLogFile in serviceLogFiles)
-        {
-            var report = await ProcessLogFileAsync(serviceLogFile);
-            if (reports.ContainsKey(report.ServiceName))
+        var curTasks = serviceLogFiles.Select(async serviceLogFile => await ProcessLogFileAsync(serviceLogFile)).ToArray();
+        await Task.WhenAll(curTasks);
+        var keyValuePairs = curTasks.Select(task => new KeyValuePair<string,  LogReport>(task.Result.ServiceName, task.Result));
+        Dictionary<string, LogReport> reports = keyValuePairs.GroupBy(pair => pair.Key)
+            .ToDictionary(group => group.Key, group => new LogReport
             {
-                var existingReport = reports[report.ServiceName];
-                existingReport.CategoryCounts = existingReport.CategoryCounts
-                    .Concat(report.CategoryCounts)
-                    .GroupBy(pair => pair.Key)
-                    .ToDictionary(group => group.Key, group => group.Sum(pair => pair.Value));
-                existingReport.NumberOfRotations += report.NumberOfRotations;
-                if (existingReport.EarliestEntry == null)
-                {
-                    existingReport.EarliestEntry = report.EarliestEntry;
-                }
-                else if (report.EarliestEntry != null)
-                {
-                    existingReport.EarliestEntry = existingReport.EarliestEntry < report.EarliestEntry
-                        ? existingReport.EarliestEntry
-                        : report.EarliestEntry;
-                }
-                if (existingReport.LatestEntry == null)
-                {
-                    existingReport.LatestEntry = report.LatestEntry;
-                }
-                else if (report.LatestEntry != null)
-                {
-                    existingReport.LatestEntry = existingReport.LatestEntry > report.LatestEntry
-                        ? existingReport.LatestEntry
-                        : report.LatestEntry;
-                }
-            }
-            else
-            {
-                reports[report.ServiceName] = report;
-            }
-        }
+                ServiceName = group.Key,
+                CategoryCounts = group.Select(pair => pair.Value.CategoryCounts)
+                    .Aggregate((dict1, dict2) => dict1.Concat(dict2)
+                        .GroupBy(pair => pair.Key)
+                        .ToDictionary(g => g.Key, g => g.Sum(pair => pair.Value))),
+                NumberOfRotations = group.Sum(pair => pair.Value.NumberOfRotations),
+                EarliestEntry = group.Select(pair => pair.Value.EarliestEntry).Min(),
+                LatestEntry = group.Select(pair => pair.Value.LatestEntry).Max()
+            });
+
 
         return reports.Values.ToList();
     }
